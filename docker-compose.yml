@@ -1,0 +1,48 @@
+services:
+  max_poster:
+    build: .
+    container_name: max_poster
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/Moscow
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # HEALTHCHECK дублируется здесь (в Dockerfile тоже есть)
+    # чтобы docker compose ps показывал статус health
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    labels:
+      # Разрешаем autoheal перезапускать этот контейнер при unhealthy
+      - "autoheal=true"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Autoheal — перезапускает контейнеры со статусом unhealthy.
+  # Docker HEALTHCHECK сам по себе только помечает контейнер,
+  # но не перезапускает его. Autoheal закрывает этот пробел.
+  autoheal:
+    image: willfarrell/autoheal
+    container_name: autoheal
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=30
+      - AUTOHEAL_START_PERIOD=120
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
