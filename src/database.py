@@ -217,6 +217,21 @@ class Database:
                 linked INTEGER NOT NULL DEFAULT 0,
                 last_pin_url TEXT,
                 UNIQUE(user_id, channel_id, button_set_type, button_index))""",
+            """CREATE TABLE IF NOT EXISTS comment_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                comment_key TEXT UNIQUE NOT NULL,
+                max_msg_id TEXT,
+                channel_id TEXT NOT NULL,
+                owner_user_id INTEGER,
+                post_text_preview TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+            """CREATE TABLE IF NOT EXISTS comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                comment_key TEXT NOT NULL,
+                commenter_max_user_id TEXT NOT NULL,
+                commenter_name TEXT NOT NULL DEFAULT '',
+                text TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
         ]
         for sql in new_tables:
             await self._db.execute(sql)
@@ -985,6 +1000,76 @@ class Database:
             (pin_url, user_id, channel_id))
         await self._db.commit()
         return cursor.rowcount
+
+    # ─── Comments (комментарии к постам) ────────────────────────────────
+
+    async def create_comment_link(self, comment_key: str, channel_id: str,
+                                   owner_user_id: int | None = None,
+                                   post_text_preview: str | None = None) -> None:
+        """Создать запись comment_link перед отправкой поста."""
+        await self._db.execute(
+            """INSERT OR IGNORE INTO comment_links
+               (comment_key, channel_id, owner_user_id, post_text_preview)
+               VALUES (?, ?, ?, ?)""",
+            (comment_key, channel_id, owner_user_id,
+             (post_text_preview or "")[:200]))
+        await self._db.commit()
+
+    async def update_comment_link_msg_id(self, comment_key: str,
+                                          max_msg_id: str) -> None:
+        """Обновить msg_id после успешной отправки поста."""
+        await self._db.execute(
+            "UPDATE comment_links SET max_msg_id = ? WHERE comment_key = ?",
+            (max_msg_id, comment_key))
+        await self._db.commit()
+
+    async def get_comment_link(self, comment_key: str) -> dict | None:
+        """Получить comment_link по ключу."""
+        cursor = await self._db.execute(
+            "SELECT * FROM comment_links WHERE comment_key = ?",
+            (comment_key,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def add_comment(self, comment_key: str, commenter_max_user_id: str,
+                           commenter_name: str, text: str) -> int:
+        """Добавить комментарий. Возвращает ID."""
+        cursor = await self._db.execute(
+            """INSERT INTO comments
+               (comment_key, commenter_max_user_id, commenter_name, text)
+               VALUES (?, ?, ?, ?)""",
+            (comment_key, commenter_max_user_id, commenter_name, text))
+        await self._db.commit()
+        return cursor.lastrowid
+
+    async def get_comments(self, comment_key: str, limit: int = 50,
+                            offset: int = 0) -> list[dict]:
+        """Получить комментарии к посту."""
+        cursor = await self._db.execute(
+            """SELECT * FROM comments
+               WHERE comment_key = ?
+               ORDER BY created_at ASC
+               LIMIT ? OFFSET ?""",
+            (comment_key, limit, offset))
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def count_comments(self, comment_key: str) -> int:
+        """Количество комментариев к посту."""
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) FROM comments WHERE comment_key = ?",
+            (comment_key,))
+        row = await cursor.fetchone()
+        return row[0]
+
+    async def delete_comment(self, comment_id: int,
+                              commenter_max_user_id: str) -> bool:
+        """Удалить комментарий (только автор). Возвращает True если удалён."""
+        cursor = await self._db.execute(
+            "DELETE FROM comments WHERE id = ? AND commenter_max_user_id = ?",
+            (comment_id, commenter_max_user_id))
+        await self._db.commit()
+        return cursor.rowcount > 0
 
     async def close(self) -> None:
         if self._db:

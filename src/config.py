@@ -51,6 +51,7 @@ class Config:
     log_dir: str
     webhook_url: str          # URL для отправки событий (добавление/удаление каналов)
     tariff_api_url: str       # URL API тарифов (пустая строка = отключено)
+    bot_link: str             # Deeplink URL бота (https://max.ru/BOT_NAME) — для кнопки Комментарии
 
 
 def load_config() -> Config:
@@ -85,6 +86,7 @@ def load_config() -> Config:
         log_dir=os.environ.get("LOG_DIR", "/app/logs"),
         webhook_url=os.environ.get("WEBHOOK_URL", "").strip(),
         tariff_api_url=os.environ.get("TARIFF_API_URL", "").strip(),
+        bot_link=os.environ.get("BOT_LINK", "").strip().rstrip("/"),
     )
 
 

@@ -579,6 +579,16 @@ class BotDispatcher:
                                     if kb:
                                         attachments.append({"type": "inline_keyboard", "payload": {"buttons": kb}})
 
+                                # Кнопка комментариев
+                                sched_comment_key = ""
+                                if config.bot_link:
+                                    sched_comment_key = self._generate_comment_key()
+                                    text_preview = (text or "")[:200]
+                                    await self._db.create_comment_link(
+                                        sched_comment_key, channel_id, user_id, text_preview)
+                                    self._append_comment_button_to_attachments(
+                                        attachments, sched_comment_key)
+
                                 result = await self._client.send_message(
                                     channel_id, rendered_text,
                                     attachments=attachments or None,
@@ -587,6 +597,11 @@ class BotDispatcher:
 
                                 msg_url = result.get("message", {}).get("url")
                                 msg_mid = str(result.get("message", {}).get("body", {}).get("mid", ""))
+
+                                # Обновляем comment_link с msg_id
+                                if sched_comment_key and msg_mid:
+                                    await self._db.update_comment_link_msg_id(
+                                        sched_comment_key, msg_mid)
 
                                 # Закрепляем если тип pin
                                 if post_type == "pin" and msg_mid:
@@ -844,16 +859,30 @@ class BotDispatcher:
         if kb:
             attachments.append({"type": "inline_keyboard", "payload": {"buttons": kb}})
 
+        # Кнопка комментариев
+        intercept_comment_key = ""
+        if config.bot_link:
+            intercept_comment_key = self._generate_comment_key()
+            text_preview = (text_content or "")[:200]
+            await self._db.create_comment_link(
+                intercept_comment_key, channel_id, owner_user_id, text_preview)
+            self._append_comment_button_to_attachments(attachments, intercept_comment_key)
+
         # Рендерим текст
         rendered_text, rendered_format, rendered_markup = self._render_post_text(text_content, markup)
 
         try:
-            await self._client.send_message(
+            result = await self._client.send_message(
                 channel_id, rendered_text,
                 attachments=attachments or None,
                 format=rendered_format, markup=rendered_markup,
             )
             logger.info("Regular intercept: reposted to %s with %d buttons" % (channel_id, len(regular_buttons)))
+            # Обновляем comment_link с msg_id
+            if intercept_comment_key:
+                msg_mid = str(result.get("message", {}).get("body", {}).get("mid", ""))
+                if msg_mid:
+                    await self._db.update_comment_link_msg_id(intercept_comment_key, msg_mid)
         except Exception as e:
             logger.error("Regular intercept: repost failed channel=%s: %s" % (channel_id, e))
 
@@ -889,12 +918,75 @@ class BotDispatcher:
             kb.append(row)
         return kb
 
+    # ─── Хелпер: кнопка комментариев ────────────────────────────────────
+
+    @staticmethod
+    def _generate_comment_key() -> str:
+        """Генерировать уникальный ключ для привязки комментариев к посту."""
+        return secrets.token_urlsafe(8)  # ~11 символов, URL-safe
+
+    @staticmethod
+    def _make_comment_button(comment_key: str) -> list[dict]:
+        """
+        Создать кнопку [💬 Комментарии] для поста.
+        Возвращает строку клавиатуры (список из одной кнопки).
+        Если BOT_LINK не настроен — возвращает пустой список.
+        """
+        if not config.bot_link:
+            return []
+        url = "%s?start=c_%s" % (config.bot_link, comment_key)
+        return [{"type": "link", "text": "💬 Комментарии", "url": url}]
+
+    def _append_comment_button_to_attachments(
+        self, attachments: list, comment_key: str
+    ) -> list:
+        """
+        Добавить кнопку комментариев в attachments поста.
+        Если inline_keyboard уже есть — добавляет строку в конец.
+        Если нет — создаёт новый inline_keyboard.
+        """
+        btn_row = self._make_comment_button(comment_key)
+        if not btn_row:
+            return attachments
+
+        # Ищем существующий inline_keyboard
+        for att in attachments:
+            if isinstance(att, dict) and att.get("type") == "inline_keyboard":
+                att["payload"]["buttons"].append(btn_row)
+                return attachments
+
+        # Нет клавиатуры — создаём новую
+        attachments.append({
+            "type": "inline_keyboard",
+            "payload": {"buttons": [btn_row]},
+        })
+        return attachments
+
     # ─── bot_started ─────────────────────────────────────────────────────
 
     async def _handle_bot_started(self, update: dict) -> None:
         max_user_id = str(update["user"]["user_id"])
         chat_id = str(update["chat_id"])
+        payload = str(update.get("payload", "") or "").strip()
 
+        # ── Deeplink: комментарии (c_КЛЮЧ) ──
+        if payload.startswith("c_"):
+            comment_key = payload[2:]
+            # Гарантируем что пользователь есть в базе (даже без /start)
+            user = await self._db.get_user_by_max_id(max_user_id)
+            if not user:
+                token = secrets.token_urlsafe(32)
+                user = await self._db.create_user(max_user_id, chat_id, token)
+            else:
+                await self._db.update_chat_id(max_user_id, chat_id)
+            # Имя комментатора из MAX API
+            commenter_name = update.get("user", {}).get("name", "")
+            if not commenter_name:
+                commenter_name = update.get("user", {}).get("username", "")
+            await self._show_comments(max_user_id, chat_id, comment_key, commenter_name)
+            return
+
+        # ── Обычный /start — главное меню ──
         # Удаляем все прошлые сообщения бота — чат начинается с чистого листа
         deleted = await self._client.clear_bot_messages(chat_id)
         if deleted:
@@ -931,6 +1023,219 @@ class BotDispatcher:
         # Отдельное сообщение только с ID — удобно копировать для привязки в Telegram
         await self._client.send_message_direct(chat_id, max_user_id)
 
+    # ─── Комментарии ─────────────────────────────────────────────────────
+
+    async def _show_comments(self, max_user_id: str, chat_id: str,
+                              comment_key: str, commenter_name: str = "",
+                              page: int = 0) -> None:
+        """Показать комментарии к посту с пагинацией."""
+        link = await self._db.get_comment_link(comment_key)
+        if not link:
+            await self._reply(
+                chat_id, max_user_id,
+                "❌ Пост не найден или ссылка устарела.",
+                attachments=self._kb([self._back()]))
+            return
+
+        per_page = 20
+        total = await self._db.count_comments(comment_key)
+        comments = await self._db.get_comments(comment_key, limit=per_page,
+                                                offset=page * per_page)
+
+        # Заголовок
+        channel_id = link.get("channel_id", "")
+        preview = link.get("post_text_preview", "")
+        if preview:
+            short_preview = preview[:100] + "…" if len(preview) > 100 else preview
+            header = "💬 <b>Комментарии</b> (%d)\n\n📝 <i>%s</i>\n" % (
+                total, html.escape(short_preview))
+        else:
+            header = "💬 <b>Комментарии</b> (%d)\n" % total
+
+        if not comments and total == 0:
+            header += "\nКомментариев пока нет. Будьте первым!"
+        else:
+            lines = []
+            for c in comments:
+                name = html.escape(c.get("commenter_name") or "Пользователь")
+                dt = c.get("created_at", "")[:16].replace("T", " ")
+                text = html.escape(c.get("text", ""))
+                # Кнопка удаления доступна только автору
+                lines.append(
+                    "\n<b>%s</b> <i>(%s)</i>\n%s" % (name, dt, text)
+                )
+            header += "\n".join(lines)
+
+        # Кнопки навигации
+        buttons = []
+
+        # Кнопка «Написать комментарий»
+        buttons.append([{
+            "type": "callback",
+            "text": "✏️ Написать комментарий",
+            "payload": "cmt_write:%s" % comment_key,
+        }])
+
+        # Пагинация
+        nav_row = []
+        if page > 0:
+            nav_row.append({
+                "type": "callback",
+                "text": "⬅️ Назад",
+                "payload": "cmt_page:%s:%d" % (comment_key, page - 1),
+            })
+        if (page + 1) * per_page < total:
+            nav_row.append({
+                "type": "callback",
+                "text": "➡️ Далее",
+                "payload": "cmt_page:%s:%d" % (comment_key, page + 1),
+            })
+        if nav_row:
+            buttons.append(nav_row)
+
+        # Удаление своих комментариев (показываем только если есть свои)
+        own_comments = [c for c in comments if str(c.get("commenter_max_user_id")) == max_user_id]
+        if own_comments:
+            buttons.append([{
+                "type": "callback",
+                "text": "🗑 Удалить мой комментарий",
+                "payload": "cmt_delmenu:%s" % comment_key,
+            }])
+
+        # Обновить
+        buttons.append([{
+            "type": "callback",
+            "text": "🔄 Обновить",
+            "payload": "cmt_page:%s:%d" % (comment_key, page),
+        }])
+
+        buttons.append(self._back())
+
+        # Сохраняем контекст для commenter_name
+        self._set_pending(max_user_id, {
+            "action": "in_comments",
+            "comment_key": comment_key,
+            "commenter_name": commenter_name,
+        })
+
+        await self._reply(chat_id, max_user_id, header,
+                           attachments=self._kb(buttons))
+
+    async def _start_write_comment(self, max_user_id: str, chat_id: str,
+                                    comment_key: str) -> None:
+        """Перевести пользователя в режим ввода комментария."""
+        state = self._pending_states.get(max_user_id, {})
+        commenter_name = state.get("commenter_name", "")
+
+        self._set_pending(max_user_id, {
+            "action": "awaiting_comment",
+            "comment_key": comment_key,
+            "commenter_name": commenter_name,
+        })
+
+        buttons = [
+            [{"type": "callback", "text": "↩️ Отмена",
+              "payload": "cmt_page:%s:0" % comment_key}],
+        ]
+
+        await self._reply(
+            chat_id, max_user_id,
+            "✏️ <b>Напишите ваш комментарий:</b>\n\n"
+            "Отправьте текст сообщения.",
+            attachments=self._kb(buttons))
+
+    async def _handle_comment_text(self, max_user_id: str, chat_id: str,
+                                    text: str) -> None:
+        """Обработать введённый текст комментария."""
+        state = self._pending_states.get(max_user_id, {})
+        comment_key = state.get("comment_key", "")
+        commenter_name = state.get("commenter_name", "")
+
+        if not comment_key:
+            del self._pending_states[max_user_id]
+            await self._show_main_menu(max_user_id, chat_id)
+            return
+
+        # Проверяем что comment_link существует
+        link = await self._db.get_comment_link(comment_key)
+        if not link:
+            del self._pending_states[max_user_id]
+            await self._reply(
+                chat_id, max_user_id,
+                "❌ Пост не найден.",
+                attachments=self._kb([self._back()]))
+            return
+
+        # Ограничение длины
+        if len(text) > 2000:
+            await self._reply(
+                chat_id, max_user_id,
+                "❌ Комментарий слишком длинный (макс. 2000 символов). Попробуйте короче:",
+                attachments=self._kb([
+                    [{"type": "callback", "text": "↩️ Отмена",
+                      "payload": "cmt_page:%s:0" % comment_key}],
+                ]))
+            return
+
+        # Если имя не получено ранее — пробуем получить
+        if not commenter_name:
+            commenter_name = "Пользователь %s" % max_user_id[:8]
+
+        await self._db.add_comment(comment_key, max_user_id, commenter_name, text)
+        logger.info("Comment added: key=%s user=%s name=%s" % (
+            comment_key, max_user_id, commenter_name))
+
+        # Показываем обновлённые комментарии
+        await self._show_comments(max_user_id, chat_id, comment_key, commenter_name)
+
+    async def _show_delete_own_comments(self, max_user_id: str, chat_id: str,
+                                         comment_key: str) -> None:
+        """Показать список своих комментариев для удаления."""
+        comments = await self._db.get_comments(comment_key, limit=100)
+        own = [c for c in comments if str(c.get("commenter_max_user_id")) == max_user_id]
+
+        if not own:
+            await self._reply(
+                chat_id, max_user_id,
+                "У вас нет комментариев к этому посту.",
+                attachments=self._kb([
+                    [{"type": "callback", "text": "💬 К комментариям",
+                      "payload": "cmt_page:%s:0" % comment_key}],
+                    self._back(),
+                ]))
+            return
+
+        lines = ["🗑 <b>Выберите комментарий для удаления:</b>\n"]
+        buttons = []
+        for c in own:
+            short_text = c["text"][:60] + "…" if len(c["text"]) > 60 else c["text"]
+            dt = c.get("created_at", "")[:16].replace("T", " ")
+            lines.append("• <i>%s</i> (%s)" % (html.escape(short_text), dt))
+            buttons.append([{
+                "type": "callback",
+                "text": "❌ %s" % (short_text[:40]),
+                "payload": "cmt_del:%s:%d" % (comment_key, c["id"]),
+            }])
+
+        buttons.append([{
+            "type": "callback", "text": "💬 К комментариям",
+            "payload": "cmt_page:%s:0" % comment_key,
+        }])
+        buttons.append(self._back())
+
+        await self._reply(chat_id, max_user_id, "\n".join(lines),
+                           attachments=self._kb(buttons))
+
+    async def _delete_own_comment(self, max_user_id: str, chat_id: str,
+                                   comment_key: str, comment_id: int) -> None:
+        """Удалить свой комментарий."""
+        deleted = await self._db.delete_comment(comment_id, max_user_id)
+        if deleted:
+            logger.info("Comment %d deleted by %s" % (comment_id, max_user_id))
+        state = self._pending_states.get(max_user_id, {})
+        commenter_name = state.get("commenter_name", "")
+        await self._show_comments(max_user_id, chat_id, comment_key, commenter_name)
+
     # ─── message_created ─────────────────────────────────────────────────
 
     async def _handle_message(self, update: dict) -> None:
@@ -962,6 +1267,22 @@ class BotDispatcher:
         await self._client.send_action(chat_id, "mark_seen")
 
         user = await self._ensure_user(max_user_id, chat_id)
+
+        # Комментарии доступны всем — обрабатываем ДО тарифной проверки
+        state_pre = self._pending_states.get(max_user_id)
+        if state_pre and state_pre.get("action") == "awaiting_comment":
+            comment_text = msg.get("body", {}).get("text", "").strip()
+            if comment_text:
+                await self._handle_comment_text(max_user_id, chat_id, comment_text)
+            else:
+                await self._reply(
+                    chat_id, max_user_id,
+                    "❌ Отправьте текстовое сообщение.",
+                    attachments=self._kb([
+                        [{"type": "callback", "text": "↩️ Отмена",
+                          "payload": "cmt_page:%s:0" % state_pre.get("comment_key", "")}],
+                    ]))
+            return
 
         # Проверка тарифной блокировки
         if not await self._db.is_user_active(max_user_id):
@@ -1094,8 +1415,8 @@ class BotDispatcher:
             await self._client.answer_callback(callback_id, notification="Нажмите /start")
             return
 
-        # Проверка тарифной блокировки
-        if not await self._db.is_user_active(max_user_id):
+        # Проверка тарифной блокировки (комментарии доступны всем)
+        if not payload.startswith("cmt_") and not await self._db.is_user_active(max_user_id):
             await self._client.answer_callback(callback_id, notification="Доступ ограничен — тариф не активен")
             return
 
@@ -1305,6 +1626,29 @@ class BotDispatcher:
             parts = payload.split(":", 2)
             if len(parts) == 3:
                 await self._clear_button_group_confirmed(max_user_id, chat_id, parts[1], parts[2])
+
+        # ── Комментарии ──
+        elif payload.startswith("cmt_write:"):
+            comment_key = payload.split(":", 1)[1]
+            await self._start_write_comment(max_user_id, chat_id, comment_key)
+        elif payload.startswith("cmt_page:"):
+            parts = payload.split(":", 2)
+            if len(parts) == 3:
+                comment_key = parts[1]
+                page = int(parts[2]) if parts[2].isdigit() else 0
+                state = self._pending_states.get(max_user_id, {})
+                commenter_name = state.get("commenter_name", "")
+                await self._show_comments(max_user_id, chat_id, comment_key,
+                                           commenter_name, page)
+        elif payload.startswith("cmt_delmenu:"):
+            comment_key = payload.split(":", 1)[1]
+            await self._show_delete_own_comments(max_user_id, chat_id, comment_key)
+        elif payload.startswith("cmt_del:"):
+            parts = payload.split(":", 2)
+            if len(parts) == 3:
+                comment_key = parts[1]
+                comment_id = int(parts[2]) if parts[2].isdigit() else 0
+                await self._delete_own_comment(max_user_id, chat_id, comment_key, comment_id)
 
         # ── Админы ──
         elif payload.startswith("del_admin:"):
@@ -2181,6 +2525,15 @@ class BotDispatcher:
                         btn_urls = [b.get("url", "?")[:60] for row in kb for b in row]
                         logger.debug("BATCH_BUTTONS channel=%s urls=%s" % (channel_id, btn_urls))
 
+                # Кнопка комментариев
+                comment_key = ""
+                if config.bot_link:
+                    comment_key = self._generate_comment_key()
+                    text_preview = (text or "")[:200]
+                    await self._db.create_comment_link(
+                        comment_key, channel_id, user["id"], text_preview)
+                    self._append_comment_button_to_attachments(attachments, comment_key)
+
                 try:
                     rendered_text, rendered_format, rendered_markup = self._render_post_text(text, markup)
                     logger.debug("BATCH_TEXT_DUMP channel=%s repr=%s" % (channel_id, repr(rendered_text)))
@@ -2188,7 +2541,7 @@ class BotDispatcher:
                         "Batch payload preview channel=%s title=%s text_len=%s markup=%s media=%s buttons=%s"
                         % (channel_id, channel_title, len(rendered_text or ""), len(rendered_markup or []), len(resolved_tokens), bool(fixed_buttons))
                     )
-                    await self._client.send_message(
+                    result = await self._client.send_message(
                         channel_id,
                         rendered_text,
                         attachments=attachments or None,
@@ -2197,6 +2550,11 @@ class BotDispatcher:
                     )
                     ch_sent += 1
                     sent_total += 1
+                    # Обновляем comment_link с msg_id
+                    if comment_key:
+                        msg_mid = str(result.get("message", {}).get("body", {}).get("mid", ""))
+                        if msg_mid:
+                            await self._db.update_comment_link_msg_id(comment_key, msg_mid)
                 except Exception as e:
                     # Fallback: если ошибка связана с кнопками — пробуем без них
                     has_keyboard = any(

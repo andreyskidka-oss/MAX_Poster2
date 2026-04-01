@@ -24,6 +24,7 @@ api.py — aiohttp REST API сервер v3.0.
 
 import asyncio
 import json as _json
+import secrets
 
 from aiohttp import web
 from loguru import logger
@@ -338,6 +339,25 @@ async def create_api_server(
         if keyboard_buttons:
             attachments.append({"type": "inline_keyboard", "payload": {"buttons": keyboard_buttons}})
 
+        # Кнопка комментариев (deeplink)
+        api_comment_key = ""
+        if config.bot_link:
+            api_comment_key = secrets.token_urlsafe(8)
+            await db.create_comment_link(
+                api_comment_key, channel_id, user["id"],
+                (text or "")[:200])
+            comment_url = "%s?start=c_%s" % (config.bot_link, api_comment_key)
+            comment_btn_row = [{"type": "link", "text": "💬 Комментарии", "url": comment_url}]
+            # Добавляем в существующую клавиатуру или создаём новую
+            found_kb = False
+            for att in attachments:
+                if isinstance(att, dict) and att.get("type") == "inline_keyboard":
+                    att["payload"]["buttons"].append(comment_btn_row)
+                    found_kb = True
+                    break
+            if not found_kb:
+                attachments.append({"type": "inline_keyboard", "payload": {"buttons": [comment_btn_row]}})
+
         media_urls_json = _json.dumps(media_urls) if media_urls else None
         buttons_json = _json.dumps(raw_buttons) if isinstance(raw_buttons, list) else None
 
@@ -345,13 +365,18 @@ async def create_api_server(
             result = await client.send_message(channel_id, text or "", attachments=attachments or None)
             max_msg_id = str(result.get("message", {}).get("body", {}).get("mid", ""))
 
+            # Обновляем comment_link с msg_id
+            if api_comment_key and max_msg_id:
+                await db.update_comment_link_msg_id(api_comment_key, max_msg_id)
+
             await db.save_post(
                 user_id=user["id"], channel_id=channel_id, text=text,
                 media_urls=media_urls_json, buttons_json=buttons_json,
                 order_url=order_url, has_price=has_price,
                 announcement_name=announcement_name, max_msg_id=max_msg_id, status="sent",
             )
-            return web.json_response({"ok": True, "message_id": max_msg_id})
+            return web.json_response({"ok": True, "message_id": max_msg_id,
+                                       "comment_key": api_comment_key or None})
 
         except MaxAPIError as e:
             await db.save_post(
